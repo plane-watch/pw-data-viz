@@ -13,3 +13,5 @@ wheels/
 *.png
 *.tar.gz
 *.csv
+*.csv.gz
+
