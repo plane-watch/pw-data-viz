@@ -14,7 +14,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from collections import defaultdict
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import argparse
 from typing import Dict, List, Optional, Tuple, Union
@@ -59,7 +59,8 @@ class AircraftPathVisualizer:
             'grid_size': 200,
             'color_scheme': 'altitude',  # 'altitude', 'density', 'speed'
             'background_color': 'black',
-            'use_cartopy': HAS_CARTOPY
+            'use_cartopy': HAS_CARTOPY,
+            'max_time_gap_minutes': 5  # Maximum time gap before splitting paths
         }
         
         # Merge with provided config
@@ -137,17 +138,19 @@ class AircraftPathVisualizer:
     
     def process_flight_paths(self) -> Dict:
         """
-        Group aircraft positions by ICAO to create flight paths.
+        Group aircraft positions by ICAO to create flight paths, splitting on time gaps.
         
         Returns:
-            Dictionary of flight paths keyed by ICAO code
+            Dictionary of flight path segments keyed by ICAO code
         """
         if self.df is None:
             raise ValueError("No data loaded. Call load_data() first.")
             
-        print("Creating flight paths...")
+        print("Creating flight paths with time gap detection...")
         
         flight_paths = defaultdict(list)
+        max_gap = timedelta(minutes=self.config['max_time_gap_minutes'])
+        total_segments = 0
         
         # Group by aircraft ICAO code
         for icao, group in self.df.groupby('Icao'):
@@ -155,9 +158,9 @@ class AircraftPathVisualizer:
             group_sorted = group.sort_values('LastMsg')
             
             # Extract coordinates and metadata
-            coords = []
+            all_coords = []
             for _, row in group_sorted.iterrows():
-                coords.append({
+                all_coords.append({
                     'lat': float(row['Latitude']),
                     'lon': float(row['Longitude']),
                     'timestamp': row['LastMsg'],
@@ -167,11 +170,38 @@ class AircraftPathVisualizer:
                     'callsign': row['CallSign']
                 })
             
-            # Only include paths with multiple points
-            if len(coords) > 1:
-                flight_paths[icao] = coords
+            # Split into segments based on time gaps
+            if len(all_coords) < 2:
+                continue
+                
+            current_segment = [all_coords[0]]
+            
+            for i in range(1, len(all_coords)):
+                current_coord = all_coords[i]
+                previous_coord = all_coords[i-1]
+                
+                # Check time gap between consecutive points
+                time_diff = current_coord['timestamp'] - previous_coord['timestamp']
+                
+                if time_diff <= max_gap:
+                    # Continue current segment
+                    current_segment.append(current_coord)
+                else:
+                    # Time gap detected - save current segment and start new one
+                    if len(current_segment) >= 2:
+                        flight_paths[icao].append(current_segment)
+                        total_segments += 1
+                    
+                    # Start new segment
+                    current_segment = [current_coord]
+            
+            # Add the final segment if it has enough points
+            if len(current_segment) >= 2:
+                flight_paths[icao].append(current_segment)
+                total_segments += 1
         
-        print(f"Created {len(flight_paths)} flight paths")
+        print(f"Created {total_segments} flight path segments from {len(flight_paths)} aircraft")
+        print(f"Time gap threshold: {self.config['max_time_gap_minutes']} minutes")
         self.flight_paths = flight_paths
         return flight_paths
     
@@ -183,10 +213,12 @@ class AircraftPathVisualizer:
         all_lats = []
         all_lons = []
         
-        for path in self.flight_paths.values():
-            for point in path:
-                all_lats.append(point['lat'])
-                all_lons.append(point['lon'])
+        # Handle segmented paths - each ICAO now has a list of segments
+        for segments in self.flight_paths.values():
+            for segment in segments:
+                for point in segment:
+                    all_lats.append(point['lat'])
+                    all_lons.append(point['lon'])
         
         if not all_lats:
             return None
@@ -324,57 +356,59 @@ class AircraftPathVisualizer:
     
     def _draw_altitude_based_paths(self) -> None:
         """Draw flight paths colored by altitude."""
-        path_count = 0
+        segment_count = 0
         
         # Create colormap for smooth altitude transitions
         altitude_cmap = self._create_altitude_colormap()
         
-        for icao, path in self.flight_paths.items():
-            if len(path) < 2:
-                continue
+        # Handle segmented paths - each ICAO now has a list of segments
+        for icao, segments in self.flight_paths.items():
+            for segment in segments:
+                if len(segment) < 2:
+                    continue
+                    
+                # Extract path coordinates and altitudes for this segment
+                lats = [p['lat'] for p in segment]
+                lons = [p['lon'] for p in segment]
+                altitudes = [p['altitude'] for p in segment]
                 
-            # Extract path coordinates and altitudes
-            lats = [p['lat'] for p in path]
-            lons = [p['lon'] for p in path]
-            altitudes = [p['altitude'] for p in path]
-            
-            # Calculate average altitude for the path
-            avg_altitude = np.mean([alt for alt in altitudes if alt > 0])
-            if np.isnan(avg_altitude):
-                avg_altitude = 0
-            
-            # Get color based on average altitude
-            color = self._get_altitude_color(avg_altitude)
-            
-            # Calculate transparency based on path density (simple version)
-            # Higher altitudes get slightly more opacity
-            if avg_altitude > 30000:
-                alpha = 0.8
-            elif avg_altitude > 20000:
-                alpha = 0.6
-            elif avg_altitude > 10000:
-                alpha = 0.5
-            elif avg_altitude > 1000:
-                alpha = 0.4
-            else:
-                alpha = 0.3
-            
-            # Draw the path
-            if self.config['use_cartopy'] and HAS_CARTOPY:
-                self.ax.plot(lons, lats, color=color, alpha=alpha, 
-                           linewidth=self.config['line_width'], 
-                           transform=ccrs.PlateCarree())
-            else:
-                self.ax.plot(lons, lats, color=color, alpha=alpha, 
-                           linewidth=self.config['line_width'])
-            
-            path_count += 1
-            
-            # Progress indicator for large datasets
-            if path_count % 1000 == 0:
-                print(f"Drawn {path_count} paths...")
+                # Calculate average altitude for the segment
+                avg_altitude = np.mean([alt for alt in altitudes if alt > 0])
+                if np.isnan(avg_altitude):
+                    avg_altitude = 0
+                
+                # Get color based on average altitude
+                color = self._get_altitude_color(avg_altitude)
+                
+                # Calculate transparency based on altitude
+                # Higher altitudes get slightly more opacity
+                if avg_altitude > 30000:
+                    alpha = 0.8
+                elif avg_altitude > 20000:
+                    alpha = 0.6
+                elif avg_altitude > 10000:
+                    alpha = 0.5
+                elif avg_altitude > 1000:
+                    alpha = 0.4
+                else:
+                    alpha = 0.3
+                
+                # Draw the segment
+                if self.config['use_cartopy'] and HAS_CARTOPY:
+                    self.ax.plot(lons, lats, color=color, alpha=alpha, 
+                               linewidth=self.config['line_width'], 
+                               transform=ccrs.PlateCarree())
+                else:
+                    self.ax.plot(lons, lats, color=color, alpha=alpha, 
+                               linewidth=self.config['line_width'])
+                
+                segment_count += 1
+                
+                # Progress indicator for large datasets
+                if segment_count % 1000 == 0:
+                    print(f"Drawn {segment_count} path segments...")
         
-        print(f"Drew {path_count} flight paths using altitude-based coloring")
+        print(f"Drew {segment_count} flight path segments using altitude-based coloring")
     
     def save_outputs(self, base_filename: str = 'aircraft_paths', 
                     formats: List[str] = ['png'], 
@@ -476,9 +510,10 @@ class AircraftPathVisualizer:
         saved_files = self.save_outputs(output_base, formats, dpi, high_res)
         
         # Show statistics
-        total_points = sum(len(path) for path in self.flight_paths.values())
+        total_segments = sum(len(segments) for segments in self.flight_paths.values())
+        total_points = sum(len(segment) for segments in self.flight_paths.values() for segment in segments)
         print(f"\n✓ Visualization completed successfully!")
-        print(f"✓ Processed {len(self.flight_paths)} flight paths")
+        print(f"✓ Processed {len(self.flight_paths)} aircraft with {total_segments} path segments")
         print(f"✓ Total data points: {total_points:,}")
         print(f"✓ Map covers {self.bounds['min_lat']:.3f}° to {self.bounds['max_lat']:.3f}° latitude")
         print(f"✓ Map covers {self.bounds['min_lon']:.3f}° to {self.bounds['max_lon']:.3f}° longitude")
